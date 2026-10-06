@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Voice-Backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# CPU-only torch wheels: the default PyPI torch on Linux pulls several GB of
+# CUDA libraries that a CPU host never uses.
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 COPY Voice-Backend/app ./app
 
