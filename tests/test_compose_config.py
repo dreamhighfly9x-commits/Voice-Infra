@@ -30,6 +30,14 @@ class TestNginxProxiesToBackend(unittest.TestCase):
         self.assertNotIn("ports", backend_service)
         self.assertEqual(proxy_target, "http://backend:8000/api/")
 
+    def test_nginxConfig_goOwnedPrefixes_proxyToApiService(self):
+        # Must match Voice-Frontend/vite.config.js: these prefixes belong to the Go api.
+        for prefix in ("= /api/me", "/api/auth/", "/api/admin/", "/api/usage", "/api/projects",
+                       "/api/segments/", "/api/jobs/", "/api/segment-jobs/", "/api/audio-versions/"):
+            match = re.search(r"location (?:\^~ )?" + re.escape(prefix) + r"\s*\{[^}]*proxy_pass\s+(\S+);", NGINX_CONF)
+            self.assertIsNotNone(match, f"nginx.conf has no Go route for {prefix}")
+            self.assertEqual(match.group(1), "http://api:8080")
+
     def test_nginxConfig_backendPort_matchesDockerfileExposedPort(self):
         exposed = re.search(r"^EXPOSE\s+(\d+)", BACKEND_DOCKERFILE, re.MULTILINE)
         self.assertIsNotNone(exposed)

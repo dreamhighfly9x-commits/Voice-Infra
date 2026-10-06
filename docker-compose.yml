@@ -12,6 +12,11 @@ x-log-env: &log-env
   LOG_LEVEL: ${LOG_LEVEL:-info}
   APP_VERSION: ${APP_VERSION:-dev}
 
+# Secrets and per-host settings come from Voice-Infra/.env (never committed):
+#   JWT_SECRET (required), TTS_ENCRYPTION_KEY, APP_ENV, APP_VERSION.
+# APP_ENV=production|staging makes the refresh cookie `Secure`, which browsers
+# drop over plain HTTP -> use APP_ENV=development on a bare-IP box without TLS.
+
 services:
   postgres:
     logging: *default-logging
@@ -22,8 +27,9 @@ services:
       POSTGRES_DB: voice
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Loopback only: reachable for host-side tools / SSH tunnels, never from the internet.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U voice"]
@@ -35,7 +41,7 @@ services:
     logging: *default-logging
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -56,12 +62,20 @@ services:
       # encrypts stored provider API keys. Supply secrets via host env, not here.
       <<: *log-env
       SERVICE_NAME: tts-api
-      APP_ENV: production
+      APP_ENV: ${APP_ENV:-production}
       REDIS_URL: redis://redis:6379/0
+      # app/access.py validates every request's token against the Go API's /api/me.
+      VOICE_AUTH_URL: http://api:8080
+      # Provider manager (external TTS APIs) stores providers/voices in Postgres.
+      DATABASE_URL: postgres://voice:voice@postgres:5432/voice?sslmode=disable
       TTS_ENCRYPTION_KEY: ${TTS_ENCRYPTION_KEY:-}
       TTS_ALLOWED_HOSTS: ${TTS_ALLOWED_HOSTS:-}
     depends_on:
       redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      api:
         condition: service_started
     restart: unless-stopped
     healthcheck:
@@ -102,8 +116,8 @@ services:
       start_period: 300s # first boot downloads the model from Hugging Face
 
   # Main Go API — auth/RBAC (.claude/references/auth-flow.md + RBAC.md) plus
-  # projects/text/voice/tts/quota/admin (docs/02-ky-thuat/build-plan-tts.md). Not yet
-  # wired to Voice-Frontend, which still talks to the legacy `backend` below.
+  # projects/text/voice/tts/quota/admin (docs/02-ky-thuat/build-plan-tts.md).
+  # nginx (frontend) routes the Go-owned /api prefixes here; see nginx.conf.
   api:
     logging: *default-logging
     build:
@@ -121,18 +135,18 @@ services:
         condition: service_started
     environment:
       <<: *log-env
-      APP_ENV: production
+      APP_ENV: ${APP_ENV:-production}
       PORT: "8080"
       DATABASE_URL: postgres://voice:voice@postgres:5432/voice?sslmode=disable
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-every-env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in Voice-Infra/.env}
       TTS_ENGINE_URL: http://tts-engine:8100
       CORS_ORIGINS: "http://localhost"
       MEDIA_DIR: /data
     volumes:
       - go_media:/data
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
 
   worker:
@@ -152,7 +166,7 @@ services:
         condition: service_started
     environment:
       <<: *log-env
-      APP_ENV: production
+      APP_ENV: ${APP_ENV:-production}
       DATABASE_URL: postgres://voice:voice@postgres:5432/voice?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       TTS_ENGINE_URL: http://tts-engine:8100
@@ -170,6 +184,7 @@ services:
       - "80:80"
     depends_on:
       - backend
+      - api
     restart: unless-stopped
 
 volumes:
