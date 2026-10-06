@@ -1,0 +1,21 @@
+# TTS engine — Voice-Backend/tts-engine/server.py, the separated VieNeu-TTS
+# HTTP wrapper the Go API/worker call over TTS_ENGINE_URL.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsndfile1 \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Voice-Backend/tts-engine/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY Voice-Backend/tts-engine ./
+
+ENV HF_HOME=/data/huggingface
+VOLUME ["/data"]
+EXPOSE 8100
+
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8100"]

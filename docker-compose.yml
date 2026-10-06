@@ -1,0 +1,180 @@
+# Every service logs to stdout; Docker keeps the lines, rotated so disks never
+# fill up (10 MB x 5 files per container). App services emit one JSON object
+# per line with a shared request_id. Read: `docker compose logs -f api`, or
+# filter JSON, e.g. `docker compose logs --no-log-prefix api | jq 'select(.level=="error")'`.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-log-env: &log-env
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  APP_VERSION: ${APP_VERSION:-dev}
+
+services:
+  postgres:
+    logging: *default-logging
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: voice
+      POSTGRES_PASSWORD: voice
+      POSTGRES_DB: voice
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voice"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    logging: *default-logging
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: Voice-Infra/Dockerfile.backend
+    volumes:
+      - voice_storage:/data
+    environment:
+      VOICE_CORS_ORIGINS: "http://localhost"
+      # TTS Provider Manager: Redis powers provider rate limiting; the key
+      # encrypts stored provider API keys. Supply secrets via host env, not here.
+      <<: *log-env
+      SERVICE_NAME: tts-api
+      APP_ENV: production
+      REDIS_URL: redis://redis:6379/0
+      TTS_ENCRYPTION_KEY: ${TTS_ENCRYPTION_KEY:-}
+      TTS_ALLOWED_HOSTS: ${TTS_ALLOWED_HOSTS:-}
+    depends_on:
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 300s # first boot downloads the model from Hugging Face
+
+  migrate:
+    logging: *default-logging
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../Voice-Backend/migrations:/migrations
+    command: ["-path", "/migrations", "-database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable", "up"]
+    restart: "no"
+
+  # Separated TTS engine (Voice-Backend/tts-engine/server.py) — the HTTP
+  # boundary `api`/`worker` call over TTS_ENGINE_URL so swapping models never
+  # touches the Go code (build-plan-tts.md "Key Decisions").
+  tts-engine:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: Voice-Infra/Dockerfile.tts-engine
+    volumes:
+      - tts_engine_outputs:/app/outputs
+      - tts_engine_hf_cache:/data/huggingface
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 300s # first boot downloads the model from Hugging Face
+
+  # Main Go API — auth/RBAC (.claude/references/auth-flow.md + RBAC.md) plus
+  # projects/text/voice/tts/quota/admin (docs/02-ky-thuat/build-plan-tts.md). Not yet
+  # wired to Voice-Frontend, which still talks to the legacy `backend` below.
+  api:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: Voice-Infra/Dockerfile.backend-go
+    command: ["api"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      tts-engine:
+        condition: service_started
+    environment:
+      <<: *log-env
+      APP_ENV: production
+      PORT: "8080"
+      DATABASE_URL: postgres://voice:voice@postgres:5432/voice?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-every-env}
+      TTS_ENGINE_URL: http://tts-engine:8100
+      CORS_ORIGINS: "http://localhost"
+      MEDIA_DIR: /data
+    volumes:
+      - go_media:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  worker:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: Voice-Infra/Dockerfile.backend-go
+    command: ["worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      tts-engine:
+        condition: service_started
+    environment:
+      <<: *log-env
+      APP_ENV: production
+      DATABASE_URL: postgres://voice:voice@postgres:5432/voice?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      TTS_ENGINE_URL: http://tts-engine:8100
+      MEDIA_DIR: /data
+    volumes:
+      - go_media:/data
+    restart: unless-stopped
+
+  frontend:
+    logging: *default-logging
+    build:
+      context: ..
+      dockerfile: Voice-Infra/Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  voice_storage:
+  postgres_data:
+  tts_engine_outputs:
+  tts_engine_hf_cache:
+  go_media:
